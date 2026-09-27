@@ -4,3 +4,9 @@ __pycache__/
 .env
 .pycache/
 data/cache/
+
+# Daily time series derived from Yahoo Finance data: generated locally by the
+# scripts, never committed. The charts and summary CSVs in outputs/ are committed.
+outputs/metals_rotation_*.csv
+!outputs/metals_rotation_timing.csv
+outputs/zijin_2899_spin_off_check.csv

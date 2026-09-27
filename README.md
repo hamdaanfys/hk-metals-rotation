@@ -43,17 +43,22 @@ The tests run offline on small synthetic price/volume data; any call to yfinance
 
 ## Outputs
 
-- `outputs/metals_rotation_hsce.png`: stacked rotation chart vs the Hang Seng China Enterprises Index (primary).
-- `outputs/metals_rotation_hsce.csv`: daily rotation data and signal flags vs the Hang Seng China Enterprises Index (primary).
-- `outputs/metals_rotation_hsi.png`: stacked rotation chart vs the Hang Seng Index (sanity check).
-- `outputs/metals_rotation_hsi.csv`: daily rotation data and signal flags vs the Hang Seng Index (sanity check).
-- `outputs/metals_rotation_timing.csv`: first onset, momentum week and hindsight lift on or after `--analysis-start`, vs the primary benchmark.
-- `outputs/rotation_onset_events.csv`: one row per onset (primary benchmark and setting) with the signal inputs, forward 20/60-session relative returns, and whether a lift followed.
-- `outputs/rotation_onset_summary.csv`: onsets vs base rate per horizon, permutation p-values and episode counts, for `^HSCE` (primary) and `^HSI` (sanity), under each lift label (`lift_label` column).
-- `outputs/rotation_onset_sensitivity.csv`: the same statistics over the z-threshold x count-rule grid.
-- `outputs/rotation_lift_episodes.csv`: every hindsight lift under each label and whether an onset came before it, late, or not at all.
-- `outputs/metals_basket_weights.csv`: the exact weights used.
-- `outputs/zijin_2899_spin_off_check.png` / `.csv`: adjusted-close sanity check for Zijin Mining around the Zijin Gold listing, written by `scripts/check_zijin_spin_off.py`.
+**Committed** (in `outputs/`):
+
+- `metals_rotation_hsce.png`: stacked rotation chart vs the Hang Seng China Enterprises Index (primary).
+- `metals_rotation_hsi.png`: stacked rotation chart vs the Hang Seng Index (sanity check).
+- `rotation_onset_events.csv`: one row per onset (primary benchmark and setting) with the signal inputs, forward 20/60-session relative returns, and whether a lift followed under each label.
+- `rotation_onset_summary.csv`: onsets vs base rate per horizon, permutation p-values and episode counts, for `^HSCE` (primary) and `^HSI` (sanity), under each lift label (`lift_label` column).
+- `rotation_onset_sensitivity.csv`: the same statistics over the z-threshold x count-rule grid.
+- `rotation_lift_episodes.csv`: every hindsight lift under each label and whether an onset came before it, late, or not at all.
+- `metals_rotation_timing.csv`: first onset, momentum week and hindsight lift on or after `--analysis-start`, vs the primary benchmark (one row).
+- `metals_basket_weights.csv`: the exact weights used.
+- `zijin_2899_spin_off_check.png`: adjusted-close sanity check for Zijin Mining around the Zijin Gold listing, written by `scripts/check_zijin_spin_off.py`.
+
+**Generated locally, gitignored.** These are daily time series derived from Yahoo Finance data, so they aren't committed. Run the scripts to create them:
+
+- `metals_rotation_hsce.csv` / `metals_rotation_hsi.csv`: daily rotation data, signal columns and hindsight-lift flags vs each benchmark.
+- `zijin_2899_spin_off_check.csv`: the Zijin adjusted close and daily returns behind the spin-off chart.
 
 Benchmarks come from `data/metals_basket.yml`: `benchmark` (`^HSCE`) is the primary benchmark and drives the timing table; `sanity_benchmarks` (`^HSI`) are charted alongside it as a cross-check. By default the script runs both:
 
