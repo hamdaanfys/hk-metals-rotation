@@ -43,3 +43,39 @@ constituents:
   - ticker: 9696.HK
     name: Tianqi Lithium
     fallback_market_cap_hkd_bn: 25
+
+# Phase 3 parameters. Fixed and committed before any evaluation was run on the
+# 2016+ history; see git history. Change them only with a note in the README.
+signal:
+  # Real-time rotation-onset signal. Turnover z-scores are per stock, on log
+  # HKD turnover vs that stock's trailing window (excluding today), then
+  # weight-averaged over stocks with a full window.
+  turnover_z_window: 252
+  z_threshold: 2.0
+  count_window: 10
+  min_count: 3
+  rs_ma_window: 50
+  onset_min_off_days: 20
+lift_label:
+  # Hindsight label for evaluation only. A lift is the first day the
+  # ma_window-day average of relative strength is at least min_rise above the
+  # lowest relative strength of the prior base_window sessions, stays at least
+  # that far above that base for hold_sessions sessions (from the lift day),
+  # and is at least min_gap sessions after the previous lift.
+  ma_window: 20
+  base_window: 60
+  min_rise: 0.05
+  hold_sessions: 20
+  min_gap: 60
+evaluation:
+  horizons: [20, 60]
+  # Forward returns start at the close entry_lag sessions after the onset.
+  entry_lag: 1
+  permutations: 10000
+  seed: 20260926
+  lift_lead_window: 60
+  lift_late_window: 20
+  false_alarm_window: 60
+  sensitivity:
+    z_threshold: [1.5, 2.0, 2.5]
+    count_rule: [[3, 10], [5, 20]]

@@ -23,7 +23,7 @@ DEFAULT_CONFIG = ROOT / "data" / "metals_basket.yml"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_CACHE_DIR = ROOT / "data" / "cache"
 # Pinned so reruns are reproducible. yfinance treats `end` as exclusive.
-DEFAULT_START = "2023-04-01"
+DEFAULT_START = "2016-01-01"
 DEFAULT_END = "2026-05-31"
 
 
