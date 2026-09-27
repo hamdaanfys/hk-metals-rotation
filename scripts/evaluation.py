@@ -28,33 +28,61 @@ class LiftParams:
         return cls(**config["lift_label"])
 
 
-def lift_labels(relative_strength: pd.Series, params: LiftParams) -> pd.DatetimeIndex:
+# Both lift-label versions are reported side by side. "revised" is a post-hoc
+# revision made after seeing the data (see README) and is frozen: no further
+# changes to either rule.
+LIFT_LABEL_METHODS = ("original", "revised")
+
+
+def lift_labels(
+    relative_strength: pd.Series, params: LiftParams, method: str
+) -> pd.DatetimeIndex:
     """Dates of decisive relative-strength lifts, found with hindsight.
 
-    A lift is a day when the ma_window-day average of relative strength first
-    rises to at least min_rise above the lowest relative strength of the prior
-    base_window sessions (it was below that hurdle the day before), and the
-    average stays at or above that same hurdle for hold_sessions sessions
-    starting on the lift day. Lifts closer than min_gap sessions to the
-    previous lift are dropped. The rule is scale-free, so it means the same
-    thing whatever level relative strength happens to be rebased to.
+    The "lifted" condition holds on a day when the ma_window-day average of
+    relative strength is at least min_rise above the lowest relative strength
+    of the prior base_window sessions. A day "holds" if the average then stays
+    at or above that day's hurdle for hold_sessions sessions starting that day.
+    Lifts closer than min_gap sessions to the previous lift are dropped. The
+    rule is scale-free, so it means the same thing whatever level relative
+    strength happens to be rebased to.
+
+    - "original" (pre-registered): the day the condition switches on, if that
+      day holds.
+    - "revised" (post-hoc, frozen): in each switched-on run that began with a
+      genuine switch-on, the first day that holds. Identical to "original"
+      whenever the switch-on day holds; it differs only when the switch-on
+      day fails the hold but the condition never switches off, which made the
+      original label miss sustained rallies such as 2025-26.
+      Known quirk: a sharp drop lowers the rolling base and so the hurdle, so
+      the revised lift can land on a falling day at a local low (2025-02-28
+      is one) rather than after a 5% rise.
 
     Hindsight label, not a live signal: the hold condition looks ahead by
     hold_sessions sessions by design.
     """
+    if method not in LIFT_LABEL_METHODS:
+        raise ValueError(f"unknown lift label method {method!r}; expected one of {LIFT_LABEL_METHODS}")
     ma = relative_strength.rolling(params.ma_window, min_periods=params.ma_window).mean()
     base = relative_strength.shift(1).rolling(params.base_window, min_periods=params.base_window).min()
     hurdle = base * (1 + params.min_rise)
     lifted = ma >= hurdle
     previous_known = ma.shift(1).notna() & hurdle.shift(1).notna()
-    crosses = lifted & previous_known & ~lifted.shift(1, fill_value=False)
+    switches_on = lifted & previous_known & ~lifted.shift(1, fill_value=False)
 
     future_min = ma[::-1].rolling(params.hold_sessions, min_periods=params.hold_sessions).min()[::-1]
     holds = future_min >= hurdle
-    candidates = [i for i, hit in enumerate((crosses & holds).to_numpy()) if hit]
+
+    if method == "original":
+        hits = switches_on & holds
+    else:
+        run = (lifted != lifted.shift(1)).cumsum()
+        genuine_run = switches_on.groupby(run).transform("any")
+        holding = lifted & genuine_run & holds
+        hits = holding & holding.astype(int).groupby(run).cumsum().eq(1)
 
     accepted: list[int] = []
-    for position in candidates:
+    for position in (i for i, hit in enumerate(hits.to_numpy()) if hit):
         if not accepted or position - accepted[-1] >= params.min_gap:
             accepted.append(position)
     return relative_strength.index[accepted]
@@ -236,32 +264,45 @@ def episode_summary(lift_episodes: pd.DataFrame, onset_outcomes: pd.DataFrame) -
 
 
 def evaluate_setting(
-    frame: pd.DataFrame, lifts: pd.DatetimeIndex, params: EvalParams, lift_hold_sessions: int
+    frame: pd.DataFrame,
+    lifts_by_label: dict[str, pd.DatetimeIndex],
+    params: EvalParams,
+    lift_hold_sessions: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
-    """Event study plus episode check for one signal setting.
+    """Event study plus episode check for one signal setting, under each lift label.
 
-    Returns the per-onset events table, the per-lift episodes table, and one
-    summary row per horizon (event statistics with the episode counts).
+    Returns the per-onset events table (with an outcome and next-lift column
+    per label), the per-lift episodes table (with a lift_label column), and
+    one summary row per label and horizon. The event statistics do not depend
+    on the label; only the episode counts do.
     """
     forward_events, rows = event_study(frame, params)
     onsets = frame.index[frame["rotation_onset"]]
-    lift_episodes, onset_outcomes = episode_check(
-        frame.index, onsets, lifts, params, lift_hold_sessions
-    )
-    events = (
-        frame.loc[onsets, ["relative_strength", "relative_strength_ma", "turnover_z", "hot_day_count"]]
-        .join(forward_events)
-        .join(onset_outcomes.set_index("onset_date"))
-    )
+    events = frame.loc[
+        onsets, ["relative_strength", "relative_strength_ma", "turnover_z", "hot_day_count"]
+    ].join(forward_events)
+    episodes, summary_rows = [], []
+    for label, lifts in lifts_by_label.items():
+        lift_episodes, onset_outcomes = episode_check(
+            frame.index, onsets, lifts, params, lift_hold_sessions
+        )
+        events = events.join(
+            onset_outcomes.set_index("onset_date").add_suffix(f"_{label}_label")
+        )
+        episodes.append(lift_episodes.assign(lift_label=label))
+        summary = episode_summary(lift_episodes, onset_outcomes)
+        summary_rows += [{"lift_label": label, **row, **summary} for row in rows]
     events.index.name = "onset_date"
-    summary = episode_summary(lift_episodes, onset_outcomes)
-    return events, lift_episodes, [{**row, **summary} for row in rows]
+    lift_episodes = pd.concat(episodes, ignore_index=True)[
+        ["lift_label", "lift_date", "status", "onset_date", "lead_sessions"]
+    ]
+    return events, lift_episodes, summary_rows
 
 
 def sensitivity_table(
     turnover_z: pd.Series,
     relative_strength: pd.Series,
-    lifts: pd.DatetimeIndex,
+    lifts_by_label: dict[str, pd.DatetimeIndex],
     signal_params: SignalParams,
     params: EvalParams,
     lift_hold_sessions: int,
@@ -279,7 +320,7 @@ def sensitivity_table(
             frame = rotation_state(turnover_z, relative_strength, setting).assign(
                 relative_strength=relative_strength
             )
-            _, _, setting_rows = evaluate_setting(frame, lifts, params, lift_hold_sessions)
+            _, _, setting_rows = evaluate_setting(frame, lifts_by_label, params, lift_hold_sessions)
             for row in setting_rows:
                 rows.append(
                     {

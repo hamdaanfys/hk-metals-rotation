@@ -57,6 +57,14 @@ signal:
   rs_ma_window: 50
   onset_min_off_days: 20
 lift_label:
+  # POST-HOC REVISION: after the first evaluation run, the pre-registered
+  # ("original") rule was found to miss visible major rallies, such as 2025-26:
+  # the condition switched on, failed the hold, and never switched off, so no
+  # lift was ever labelled. A "revised" rule (first day in each switched-on run
+  # that passes the hold) is now reported alongside the original. The
+  # parameters below are unchanged and shared by both rules. Both rules are
+  # frozen: no further changes. See scripts/evaluation.py and the README.
+  #
   # Hindsight label for evaluation only. A lift is the first day the
   # ma_window-day average of relative strength is at least min_rise above the
   # lowest relative strength of the prior base_window sessions, stays at least

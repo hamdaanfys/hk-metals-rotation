@@ -18,7 +18,14 @@ import pandas as pd
 import yfinance as yf
 import yaml
 
-from evaluation import EvalParams, LiftParams, evaluate_setting, lift_labels, sensitivity_table
+from evaluation import (
+    LIFT_LABEL_METHODS,
+    EvalParams,
+    LiftParams,
+    evaluate_setting,
+    lift_labels,
+    sensitivity_table,
+)
 from signals import SignalParams, basket_turnover_z, rotation_state
 
 
@@ -342,7 +349,7 @@ def make_timing_row(
         "momentum_threshold": momentum_threshold,
         "first_rotation_onset": onset_date,
         "first_momentum_week_above_threshold": momentum_date,
-        "first_hindsight_lift": lift_date,
+        "first_hindsight_lift_revised_label": lift_date,
     }
     for label, event_date in [
         ("onset", onset_date),
@@ -365,7 +372,7 @@ def plot_rotation_view(
     frame: pd.DataFrame,
     benchmark: str,
     weights: pd.DataFrame,
-    lifts: pd.DatetimeIndex,
+    lifts_by_label: dict[str, pd.DatetimeIndex],
     signal_params: SignalParams,
     momentum_threshold: float,
     title: str,
@@ -421,14 +428,26 @@ def plot_rotation_view(
         alpha=0.8,
         label=f"{signal_params.rs_ma_window}-day average",
     )
+    original, revised = lifts_by_label["original"], lifts_by_label["revised"]
     ax_relative.scatter(
-        lifts,
-        frame.loc[lifts, "relative_strength"],
+        revised,
+        frame.loc[revised, "relative_strength"],
         marker="^",
         s=70,
         color="#7c3aed",
         zorder=4,
-        label=f"Hindsight lift ({len(lifts)})",
+        label=f"Hindsight lift, revised label ({len(revised)})",
+    )
+    ax_relative.scatter(
+        original,
+        frame.loc[original, "relative_strength"] * 0.9,
+        marker="^",
+        s=40,
+        facecolors="none",
+        edgecolors="#374151",
+        linewidths=1.0,
+        zorder=4,
+        label=f"Hindsight lift, original label ({len(original)}; drawn just below)",
     )
     ax_relative.set_yscale("log")
     ax_relative.set_ylabel("Relative strength (log)")
@@ -466,14 +485,14 @@ def plot_rotation_view(
         (
             f"Green lines = rotation onsets ({len(onsets)}; {signal_params.label}, RS above its "
             f"{signal_params.rs_ma_window}-day average, after {signal_params.onset_min_off_days}+ off days). "
-            f"Purple triangles = hindsight lifts (evaluation label, not a signal). "
+            f"Triangles = hindsight lifts (evaluation labels, not signals; revised label is post hoc).\n"
             f"Faint red lines = week-end days where the week's basket return > "
-            f"{format_threshold(momentum_threshold)}.\nTop current-cap weights: {top_weights}."
+            f"{format_threshold(momentum_threshold)}. Top current-cap weights: {top_weights}."
         ),
         fontsize=8.5,
         color="#4b5563",
     )
-    fig.tight_layout(rect=[0, 0.045, 1, 1])
+    fig.tight_layout(rect=[0, 0.055, 1, 1])
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
@@ -511,7 +530,7 @@ def main() -> None:
     weights.to_csv(weights_path, index=False)
 
     rotation_summaries = []
-    rotations: dict[str, tuple[pd.DataFrame, pd.DatetimeIndex]] = {}
+    rotations: dict[str, tuple[pd.DataFrame, dict[str, pd.DatetimeIndex]]] = {}
     for benchmark in benchmarks:
         if benchmark not in close.columns or close[benchmark].notna().sum() == 0:
             print(f"Warning: skipping benchmark {benchmark}; no price data returned from yfinance.")
@@ -525,19 +544,27 @@ def main() -> None:
             signal_params=signal_params,
             momentum_threshold=args.momentum_threshold,
         )
-        lifts = lift_labels(rotation["relative_strength"], lift_params)
-        rotations[benchmark] = (rotation, lifts)
+        lifts_by_label = {
+            method: lift_labels(rotation["relative_strength"], lift_params, method)
+            for method in LIFT_LABEL_METHODS
+        }
+        rotations[benchmark] = (rotation, lifts_by_label)
 
         suffix = safe_name(benchmark)
         chart_path = args.output_dir / f"metals_rotation_{suffix}.png"
         data_path = args.output_dir / f"metals_rotation_{suffix}.csv"
-        rotation.assign(hindsight_lift=rotation.index.isin(lifts)).to_csv(data_path, index_label="date")
+        rotation.assign(
+            **{
+                f"hindsight_lift_{method}": rotation.index.isin(lifts)
+                for method, lifts in lifts_by_label.items()
+            }
+        ).to_csv(data_path, index_label="date")
 
         plot_rotation_view(
             frame=rotation,
             benchmark=benchmark,
             weights=weights,
-            lifts=lifts,
+            lifts_by_label=lifts_by_label,
             signal_params=signal_params,
             momentum_threshold=args.momentum_threshold,
             title=f"{config['name']} vs {benchmark_label(benchmark)}",
@@ -551,7 +578,8 @@ def main() -> None:
                 "label": benchmark_label(benchmark),
                 "ending_relative_strength": rotation["relative_strength"].iloc[-1],
                 "rotation_onsets": int(rotation["rotation_onset"].sum()),
-                "hindsight_lifts": len(lifts),
+                "lifts_original_label": len(lifts_by_label["original"]),
+                "lifts_revised_label": len(lifts_by_label["revised"]),
                 "momentum_weeks": int(rotation["momentum_week_above_threshold"].sum()),
                 "benchmark_rows": len(rotation),
                 "benchmark_missing_after_join": int(rotation["benchmark_index"].isna().sum()),
@@ -578,7 +606,7 @@ def main() -> None:
                 make_timing_row(
                     benchmark=primary_benchmark,
                     frame=primary_frame,
-                    lifts=primary_lifts,
+                    lifts=primary_lifts["revised"],
                     analysis_start=args.analysis_start,
                     momentum_threshold=args.momentum_threshold,
                 )
@@ -593,8 +621,8 @@ def main() -> None:
         lift_episodes.to_csv(evaluation_paths["episodes"], index=False)
 
         summary_rows = []
-        for benchmark, (frame, lifts) in rotations.items():
-            _, _, rows = evaluate_setting(frame, lifts, eval_params, lift_params.hold_sessions)
+        for benchmark, (frame, lifts_by_label) in rotations.items():
+            _, _, rows = evaluate_setting(frame, lifts_by_label, eval_params, lift_params.hold_sessions)
             role = "primary" if benchmark == primary_benchmark else "sanity"
             summary_rows += [
                 {"benchmark": benchmark, "role": role, "setting": signal_params.label, **row}

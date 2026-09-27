@@ -31,7 +31,7 @@ The tests run offline on small synthetic price/volume data; any call to yfinance
 - **Delisting.** A stock that stops trading is not forward-filled, and the index does not jump on its first missing day.
 - **Benchmark failure.** A benchmark with no data is skipped, and a run whose primary benchmark fails writes no timing table or evaluation.
 - **Signal rules (`test_signals.py`).** The z-score against a hand computation, zero-volume days, new listings, the weighted basket z, the count and relative-strength conditions at their edges, onset debounce, and no onsets during warm-up.
-- **Evaluation (`test_evaluation.py`).** Forward-return alignment (next-session entry), base-rate eligibility, a reproducible permutation test that detects planted events, the scale-free lift label (hold and minimum gap), lift/onset episode classification, and the sensitivity grid.
+- **Evaluation (`test_evaluation.py`).** Forward-return alignment (next-session entry), base-rate eligibility, a reproducible permutation test that detects planted events, the scale-free lift label (hold and minimum gap) under both the original and the revised rule, with a brute-force check of the revision and a test pinning its known quirk, lift/onset episode classification, and the sensitivity grid.
 
 Outputs:
 
@@ -41,9 +41,9 @@ Outputs:
 - `outputs/metals_rotation_hsi.csv`: daily rotation data and signal flags vs the Hang Seng Index (sanity check).
 - `outputs/metals_rotation_timing.csv`: first onset, momentum week and hindsight lift on or after `--analysis-start`, vs the primary benchmark.
 - `outputs/rotation_onset_events.csv`: one row per onset (primary benchmark and setting) with the signal inputs, forward 20/60-session relative returns, and whether a lift followed.
-- `outputs/rotation_onset_summary.csv`: onsets vs base rate per horizon, permutation p-values and episode counts, for `^HSCE` (primary) and `^HSI` (sanity).
+- `outputs/rotation_onset_summary.csv`: onsets vs base rate per horizon, permutation p-values and episode counts, for `^HSCE` (primary) and `^HSI` (sanity), under each lift label (`lift_label` column).
 - `outputs/rotation_onset_sensitivity.csv`: the same statistics over the z-threshold x count-rule grid.
-- `outputs/rotation_lift_episodes.csv`: every hindsight lift and whether an onset came before it, late, or not at all.
+- `outputs/rotation_lift_episodes.csv`: every hindsight lift under each label and whether an onset came before it, late, or not at all.
 - `outputs/metals_basket_weights.csv`: the exact weights used.
 - `outputs/zijin_2899_spin_off_check.png` / `.csv`: adjusted-close sanity check for Zijin Mining around the Zijin Gold listing, written by `scripts/check_zijin_spin_off.py`.
 
@@ -102,7 +102,7 @@ The timing table is computed against the primary benchmark, starts at `--analysi
 
 - first rotation onset;
 - first week-end day where the week's basket return exceeded `--momentum-threshold`;
-- first hindsight lift (see [Evaluation](#evaluation)).
+- first hindsight lift under the revised label (see [Evaluation](#evaluation)).
 
 The script also checks benchmark sanity in the printed summary: the joined benchmark rows should have no missing values and no unchanged flatline run. For the current run, both `^HSI` and `^HSCE` pass that check.
 
@@ -125,15 +125,26 @@ The chart's third panel shows the basket z-score with the threshold, and onsets 
 **The parameters were fixed before any results existed.** All signal, lift-label and evaluation parameters were committed in `e973826`, before the first evaluation run on the 2016+ history. Two things happened after that commit:
 
 - **Bug fix after the first run.** The first implementation needed all 252 days of a stock's window to be valid, so one zero-volume day switched that stock's z-score off for a year. That switched the signal off for about 60% of the history, including 2025, and it fired only twice. I saw that run's output, fixed the bug (a window needs at least half its days valid, chosen before seeing the fixed results), and reran. No parameter in the config changed.
-- **Label defect found before the evaluation.** When the lifts were first computed, they showed a flaw in the label (see "The lift label misses the big rallies" below). It was left as committed rather than tuned after the fact.
+- **Post-hoc label revision.** The pre-registered lift label missed visible major rallies, so a revised label was added after seeing the results. Both are reported (see below).
 
-**Hindsight lift label.** A lift is the day the 20-day average of relative strength first reaches at least 5% above the lowest relative strength of the prior 60 sessions, having been below that the day before. The average must stay at or above that same hurdle for 20 sessions starting on the lift day, and a lift can't come within 60 sessions of the previous one. The rule is scale-free: it doesn't depend on the level relative strength happens to be rebased to. It is a **hindsight label for evaluation, not a live signal**, because the hold condition looks 20 sessions ahead. It is deliberately excluded from the look-ahead tests.
+**Hindsight lift label.** The condition is "on" when the 20-day average of relative strength is at least 5% above the lowest relative strength of the prior 60 sessions. A day "holds" if the average then stays at or above that day's hurdle for 20 sessions, starting that day. A lift can't come within 60 sessions of the previous one. There are two rules for choosing the lift day:
+
+- **Original (pre-registered, `e973826`):** the day the condition switches on, if that day holds.
+- **Revised (post hoc, frozen):** in each switched-on period, the first day that holds.
+
+The two agree whenever the switch-on day holds. The rule is scale-free: it doesn't depend on the level relative strength happens to be rebased to. It is a **hindsight label for evaluation, not a live signal**, because the hold condition looks 20 sessions ahead. It is deliberately excluded from the look-ahead tests.
 
 **Event study.** For each onset, the forward relative return is `RS[t+1+h] / RS[t+1] − 1` for h = 20 and 60 sessions. It is measured from the close *after* the onset, since the signal is only known at the onset day's close. The base rate is the same quantity over every signal-ready day with a complete forward window. The permutation test draws the same number of random eligible dates 10,000 times (fixed seed) and reports how often they match or beat the onsets' mean and hit rate: `p = (1 + hits) / 10,001`.
 
 **Episode check.** A lift is **early** if an onset came in the 60 sessions up to and including it, **late** if the first onset came within 20 sessions after it, and **missed** otherwise. An onset is a **false alarm** if no lift follows within 60 sessions, or **pending** if the data ends too soon to tell.
 
 **Sensitivity.** The z threshold (1.5 / 2 / 2.5) and the count rule (3-of-10 / 5-of-20) are varied, with everything else fixed. The configured setting is marked `is_primary`.
+
+### Post-hoc revision of the lift label
+
+> **This revision was made after seeing the results, and both labels are now frozen.** The pre-registered label missed visible major rallies. If the condition switches on, the switch-on day fails the 20-session hold, and the condition then never switches off, no lift is ever labelled. That is what happened in 2025. The condition switched on for 2025-02-18. A drop in late February and March (relative strength fell from 735 to 685 by 2025-02-28) broke the hold. The rolling 60-session low fell with it, so the condition stayed on through the entire 2025–26 rally, with relative strength rising from about 685 to about 1,790. The revised label picks the first holding day in each switched-on period instead of requiring the switch-on day itself to hold. The thresholds, windows, hold rule and minimum gap are unchanged. Every table reports both labels (`lift_label` column), and the event study itself doesn't use the label, so its numbers are the same under both.
+>
+> **Known quirk of the revised rule.** A sharp drop lowers the rolling 60-session low, and so the hurdle. The revised lift can therefore land on a falling day at a local low, rather than after a 5% rise. Its one new lift, 2025-02-28, is exactly that: the lowest relative-strength reading between February and May 2025, labelled because the hurdle fell. In hindsight it marks where the 2025 rally started, but not for the reason the rule describes. The label is frozen, so this is documented rather than fixed.
 
 ### Current results (vs `^HSCE`, z > 2, 3-of-10)
 
@@ -146,16 +157,38 @@ There are 5 onsets: 2018-02-05, 2020-07-08, 2020-11-25, 2024-03-25 and 2025-09-3
 
 `^HSI` shows the same pattern (20-session p = 0.095, 60-session p = 0.23).
 
-**Episode check: 0 of 11 lifts preceded by an onset, and all 5 onsets are false alarms.**
+**Lifts found (2016–2026, `^HSCE`):**
+
+- **Original label, 11 lifts:** 2016-11-09, 2017-06-29, 2017-12-27, 2019-02-20, 2019-06-20, 2019-12-02, 2020-04-15, 2022-01-10, 2022-08-09, 2023-06-21 and 2023-12-13.
+- **Revised label, 12 lifts:** the same 11 plus **2025-02-28**.
+
+`^HSI` gives 13 lifts under the original label and 15 under the revised one.
+
+**Episode check:**
+
+| Lift label | Lifts | Early | Late | Missed | Onsets followed by a lift | False alarms | Pending |
+|---|---|---|---|---|---|---|---|
+| Original | 11 | 0 | 0 | 11 | 0 | 5 | 0 |
+| Revised | 12 | 0 | 0 | 12 | 0 | 5 | 0 |
+
+**What the episode check shows (a descriptive observation, not part of the fixed evaluation):** every onset fired *inside* a switched-on period whose lift had already been labelled, well after that lift:
+
+| Onset | Lift | Sessions after the lift |
+|---|---|---|
+| 2018-02-05 | 2017-12-27 | 27 |
+| 2020-07-08 | 2020-04-15 | 56 |
+| 2020-11-25 | 2020-04-15 | 152 |
+| 2024-03-25 | 2023-12-13 | 68 |
+| 2025-09-30 | 2025-02-28 (revised) | 146 |
+
+The episode check only credits onsets up to 60 sessions before a lift or 20 after it, so all five count as misses or false alarms under both labels.
 
 **Sensitivity.** Onset counts across the grid are 0–9. Where a setting has onsets, 9 of its 10 setting × horizon cells show a positive excess over the base rate (the exception is z > 2, 5-of-20 at 20 sessions: −4.8 pp). The smallest p-value in the grid is 0.054, and none is below 0.05 even before allowing for about 10 tests.
 
 **How to read this:**
 
 - **Forward returns:** the direction is encouraging, but it isn't demonstrated. Onsets were followed by better-than-usual relative returns in almost every setting, but with 1–9 events per setting nothing reaches conventional significance. More history or more baskets would be needed to tell the difference from luck.
-- **Episode check:** it says nothing useful about the signal yet, for two reasons:
-  - The signal and the label measure different things. An onset needs relative strength already above its 50-day average *and* a turnover surge, which usually comes weeks into a move rather than at its first 5% lift. The 2020-07-08 onset, for example, came 56 sessions after the 2020-04-15 lift.
-  - **The lift label misses the big rallies.** If the condition switches on, fails the 20-session hold, and then never switches off, no lift is ever labelled. That is exactly what happened in 2025: the condition switched on for 2025-02-18, the April 2025 dip broke the hold, and because the base is a rolling 60-day low the condition stayed on through the whole 2025–26 rally, with relative strength going from about 775 to about 1,790. As a result, the lifts mostly mark small moves in quiet periods (see the chart). Fixing this means changing the label after seeing the data, and any such change should be reported as post hoc.
+- **Episode check:** the signal does **not** give early warning of a lift under either label. What the data suggests instead is that it's a **confirmation signal**. It fired 27–152 sessions into rallies that were already under way, and those rallies usually kept going (the forward returns above). That fits how it's built: an onset needs relative strength already above its 50-day average *and* a turnover surge, and a surge tends to come once a move is established. Whether "confirmation" holds up as a claim needs a test designed for it on data it wasn't developed on, not this post-hoc reading.
 
 ## Known Limitations
 
@@ -165,4 +198,4 @@ There are 5 onsets: 2018-02-05, 2020-07-08, 2020-11-25, 2024-03-25 and 2025-09-3
 - **Long suspensions show up as a single-day jump when trading resumes.** A suspended name sits out of the index while halted, and the whole move from its last close to its resumption price lands on the first day it trades again.
 - **Dividend-adjusted basket vs price-index benchmarks.** The basket uses dividend-adjusted closes, while `^HSCE` and `^HSI` are price indices. That pushes relative strength up by roughly the dividend yield. The comparison of onsets with the base rate cancels most of this, but a hit rate measured against zero does not.
 - **Few events, overlapping windows.** Five onsets in about 9 years gives the event study little statistical power. The 60-session windows overlap, and random dates aren't clustered the way real onsets are, so the permutation p-values are somewhat optimistic.
-- **The lift label misses sustained rallies** that begin with a failed hold (see [Evaluation](#evaluation)). This is a flaw in the pre-registered label, and it is why the episode check reports 0 of 11.
+- **The hindsight lift labels are imperfect, and the revised one is post hoc.** The pre-registered label misses sustained rallies whose switch-on day fails the hold. The post-hoc revision fixes that, but can label a lift on a falling day at a local low (see [Evaluation](#evaluation)). Both labels are frozen and reported side by side, and neither credits the signal with an early warning.
