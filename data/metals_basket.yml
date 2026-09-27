@@ -7,7 +7,11 @@
 # 2259.HK Zijin Gold is deliberately excluded from the starter basket because
 # it does not have 3+ years of listed history.
 name: HK Diversified Metals & Mining starter basket
-benchmark: ^HSI
+# Primary benchmark: drives the timing table. sanity_benchmarks are charted
+# alongside it as a cross-check. --benchmarks on the command line overrides both.
+benchmark: ^HSCE
+sanity_benchmarks:
+  - ^HSI
 constituents:
   - ticker: 2899.HK
     name: Zijin Mining

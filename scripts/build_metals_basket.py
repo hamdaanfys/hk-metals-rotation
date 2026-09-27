@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,22 +21,34 @@ import yaml
 
 DEFAULT_CONFIG = ROOT / "data" / "metals_basket.yml"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
+DEFAULT_CACHE_DIR = ROOT / "data" / "cache"
+# Pinned so reruns are reproducible. yfinance treats `end` as exclusive.
+DEFAULT_START = "2023-04-01"
+DEFAULT_END = "2026-05-31"
 
 
 def parse_args() -> argparse.Namespace:
-    default_start = date.today() - timedelta(days=365 * 3 + 45)
     parser = argparse.ArgumentParser(
         description="Pull HK metals/mining names from yfinance and plot a cap-weighted basket."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--start", default=default_start.isoformat())
-    parser.add_argument("--end", default=date.today().isoformat())
+    parser.add_argument("--start", default=DEFAULT_START)
+    parser.add_argument("--end", default=DEFAULT_END)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Ignore cached yfinance prices and market caps and download them again.",
+    )
     parser.add_argument(
         "--benchmarks",
         nargs="+",
-        default=["^HSI", "^HSCE"],
-        help="Yahoo benchmark tickers to compare against. Defaults to ^HSI and ^HSCE.",
+        default=None,
+        help=(
+            "Yahoo benchmark tickers to compare against; the first is primary. Defaults to the "
+            "config's benchmark (primary) followed by its sanity_benchmarks."
+        ),
     )
     parser.add_argument(
         "--turnover-window",
@@ -85,33 +97,95 @@ def fetch_market_cap_hkd(ticker: str) -> float | None:
     return None
 
 
-def download_ohlcv(tickers: list[str], start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    data = yf.download(
-        tickers=tickers,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-        threads=True,
-    )
-    if data.empty:
+def cached_market_caps(tickers: list[str], cache_dir: Path, refresh: bool = False) -> dict[str, float | None]:
+    """Market caps are a live snapshot, so cache them to keep weights reproducible."""
+    path = cache_dir / "market_caps.json"
+    cached = {} if refresh or not path.exists() else json.loads(path.read_text(encoding="utf-8"))
+    missing = [ticker for ticker in tickers if cached.get(ticker) is None]
+    if missing:
+        for ticker in missing:
+            cached[ticker] = fetch_market_cap_hkd(ticker)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cached, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {ticker: cached.get(ticker) for ticker in tickers}
+
+
+def price_cache_path(cache_dir: Path, ticker: str, start: str, end: str) -> Path:
+    return cache_dir / f"{safe_name(ticker)}_{start}_{end}.csv"
+
+
+def download_ohlcv(
+    tickers: list[str],
+    start: str,
+    end: str,
+    cache_dir: Path,
+    refresh: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return adjusted close and volume, reading per-ticker CSVs from cache_dir when present.
+
+    Tickers that yfinance returns no data for are left out of the result (and
+    out of the cache), so callers must check which columns came back.
+    """
+    closes: dict[str, pd.Series] = {}
+    volumes: dict[str, pd.Series] = {}
+    to_download = []
+    for ticker in tickers:
+        path = price_cache_path(cache_dir, ticker, start, end)
+        if path.exists() and not refresh:
+            cached = pd.read_csv(path, index_col="date", parse_dates=["date"])
+            closes[ticker] = cached["close"]
+            volumes[ticker] = cached["volume"]
+        else:
+            to_download.append(ticker)
+
+    if to_download:
+        try:
+            data = yf.download(
+                tickers=to_download,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                group_by="column",
+                threads=True,
+            )
+        except Exception as exc:
+            print(f"Warning: yfinance download failed for {', '.join(to_download)}: {exc}")
+            data = pd.DataFrame()
+
+        if not data.empty:
+            close = data["Close"]
+            volume = data["Volume"]
+            if isinstance(close, pd.Series):
+                close = close.to_frame(to_download[0])
+                volume = volume.to_frame(to_download[0])
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            for ticker in to_download:
+                if ticker not in close.columns or close[ticker].notna().sum() == 0:
+                    continue
+                frame = pd.DataFrame({"close": close[ticker], "volume": volume[ticker]}).dropna(
+                    subset=["close"]
+                )
+                frame.to_csv(price_cache_path(cache_dir, ticker, start, end), index_label="date")
+                closes[ticker] = frame["close"]
+                volumes[ticker] = frame["volume"]
+
+    if not closes:
         raise RuntimeError("No price data returned from yfinance.")
 
-    close = data["Close"].copy()
-    volume = data["Volume"].copy()
-    if isinstance(close, pd.Series):
-        close = close.to_frame(tickers[0])
-        volume = volume.to_frame(tickers[0])
-
-    return close.sort_index(), volume.sort_index()
+    close = pd.DataFrame(closes).sort_index()
+    volume = pd.DataFrame(volumes).reindex(close.index)
+    return close, volume
 
 
-def make_weights(config: dict[str, Any]) -> pd.DataFrame:
+def make_weights(config: dict[str, Any], cache_dir: Path, refresh: bool = False) -> pd.DataFrame:
+    market_caps = cached_market_caps(
+        [item["ticker"] for item in config["constituents"]], cache_dir, refresh
+    )
     rows = []
     for item in config["constituents"]:
         ticker = item["ticker"]
-        market_cap = fetch_market_cap_hkd(ticker)
+        market_cap = market_caps[ticker]
         source = "yfinance"
         if market_cap is None:
             market_cap = float(item["fallback_market_cap_hkd_bn"]) * 1_000_000_000
@@ -131,12 +205,26 @@ def make_weights(config: dict[str, Any]) -> pd.DataFrame:
 
 
 def normalized_cap_weighted_index(close: pd.DataFrame, weights: pd.DataFrame) -> pd.Series:
+    """Buy-and-hold cap-weighted index that drops names once they stop trading.
+
+    Prices are forward-filled only between a ticker's first and last valid
+    close, so suspensions are bridged but a delisted name is not carried
+    forever. Each day's return is taken over names priced on both days,
+    weighted by their current holding value, which re-normalizes weights
+    across the survivors after an exit without a jump in the index level.
+    With no exits this equals 100 * sum(weight * price / first_price).
+    """
     tickers = weights["ticker"].tolist()
     close = close[tickers].dropna(how="all")
+    alive = close.ffill().notna() & close.bfill().notna()
+    close = close.ffill().where(alive)
     first_prices = close.apply(lambda s: s.dropna().iloc[0])
-    normalized = close.divide(first_prices).ffill()
-    weighted = normalized.multiply(weights.set_index("ticker")["weight"], axis=1)
-    return 100 * weighted.sum(axis=1)
+    held = close.divide(first_prices).multiply(weights.set_index("ticker")["weight"], axis=1)
+    previous = held.shift(1)
+    both = held.notna() & previous.notna()
+    growth = held.where(both).sum(axis=1) / previous.where(both).sum(axis=1)
+    growth.iloc[0] = 1.0
+    return 100 * growth.cumprod()
 
 
 def benchmark_index(close: pd.DataFrame, benchmark: str) -> pd.Series:
@@ -146,6 +234,17 @@ def benchmark_index(close: pd.DataFrame, benchmark: str) -> pd.Series:
 
 def basket_turnover_hkd(close: pd.DataFrame, volume: pd.DataFrame, tickers: list[str]) -> pd.Series:
     return close[tickers].multiply(volume[tickers]).sum(axis=1)
+
+
+def resolve_benchmarks(cli_benchmarks: list[str] | None, config: dict[str, Any]) -> list[str]:
+    """Return benchmarks with the primary first; --benchmarks overrides the config."""
+    if cli_benchmarks:
+        return list(dict.fromkeys(cli_benchmarks))
+    return list(dict.fromkeys([config["benchmark"], *config.get("sanity_benchmarks", [])]))
+
+
+def format_threshold(threshold: float) -> str:
+    return f"{threshold * 100:g}%"
 
 
 def benchmark_label(ticker: str) -> str:
@@ -189,10 +288,12 @@ def joined_rotation_frame(
     trailing_std = trailing_turnover.rolling(window=window, min_periods=min_periods).std()
     frame["turnover_breakout"] = frame["turnover"] > trailing_mean + trailing_std
 
-    weekly = frame["basket_index"].resample("W-FRI").last().dropna()
-    weekly_return = weekly.pct_change()
-    momentum_weeks = weekly_return[weekly_return > momentum_threshold].index.to_period("W-FRI")
-    frame["momentum_week_gt_10pct"] = frame.index.to_period("W-FRI").isin(momentum_weeks)
+    # Flag only the week's final trading day: that is when the weekly return is known.
+    week = frame.index.to_period("W-FRI")
+    week_close_dates = frame.index.to_series().groupby(week).max()
+    weekly_return = frame.loc[week_close_dates, "basket_index"].pct_change()
+    momentum_dates = weekly_return.index[weekly_return > momentum_threshold]
+    frame["momentum_week_above_threshold"] = frame.index.isin(momentum_dates)
     return frame[
         [
             "basket_index",
@@ -200,20 +301,13 @@ def joined_rotation_frame(
             "relative_strength",
             "turnover",
             "turnover_breakout",
-            "momentum_week_gt_10pct",
+            "momentum_week_above_threshold",
         ]
     ]
 
 
 def momentum_marker_dates(frame: pd.DataFrame) -> list[pd.Timestamp]:
-    if not frame["momentum_week_gt_10pct"].any():
-        return []
-
-    markers = []
-    flagged = frame[frame["momentum_week_gt_10pct"]].copy()
-    for _, week_rows in flagged.groupby(flagged.index.to_period("W-FRI")):
-        markers.append(week_rows.index[0])
-    return markers
+    return frame.index[frame["momentum_week_above_threshold"]].tolist()
 
 
 def max_consecutive_unchanged(series: pd.Series) -> int:
@@ -253,17 +347,19 @@ def make_timing_row(
     benchmark: str,
     frame: pd.DataFrame,
     analysis_start: str,
+    momentum_threshold: float,
 ) -> dict[str, Any]:
     turnover_date = first_signal_date(frame, "turnover_breakout", analysis_start)
-    momentum_date = first_signal_date(frame, "momentum_week_gt_10pct", analysis_start)
+    momentum_date = first_signal_date(frame, "momentum_week_above_threshold", analysis_start)
     lift_date = first_decisive_relative_lift(frame, analysis_start)
 
     row = {
         "benchmark": benchmark,
         "benchmark_label": benchmark_label(benchmark),
         "analysis_start": analysis_start,
+        "momentum_threshold": momentum_threshold,
         "first_turnover_breakout": turnover_date,
-        "first_momentum_week_gt_10pct": momentum_date,
+        "first_momentum_week_above_threshold": momentum_date,
         "first_decisive_relative_lift": lift_date,
     }
     for label, event_date in [
@@ -283,48 +379,11 @@ def make_timing_row(
     return row
 
 
-def plot_zijin_diagnostic(close: pd.DataFrame, output_path: Path) -> pd.DataFrame:
-    ticker = "2899.HK"
-    spin_date = pd.Timestamp("2025-09-30")
-    start = pd.Timestamp("2025-08-15")
-    end = pd.Timestamp("2025-11-15")
-
-    zijin = close[[ticker]].dropna().rename(columns={ticker: "adjusted_close"})
-    zijin["daily_return"] = zijin["adjusted_close"].pct_change()
-    window = zijin.loc[start:end].copy()
-
-    fig, (ax_price, ax_return) = plt.subplots(
-        2,
-        1,
-        figsize=(11, 6.5),
-        sharex=True,
-        gridspec_kw={"height_ratios": [2, 1]},
-    )
-    ax_price.plot(window.index, window["adjusted_close"], color="#1f77b4", linewidth=2)
-    ax_price.axvline(spin_date, color="#b91c1c", linewidth=1.2, alpha=0.75)
-    ax_price.set_title("2899.HK Zijin Mining adjusted close around Zijin Gold listing")
-    ax_price.set_ylabel("Adjusted close")
-    ax_price.grid(True, alpha=0.25)
-
-    ax_return.bar(window.index, 100 * window["daily_return"], color="#8bb7d8", width=1)
-    ax_return.axvline(spin_date, color="#b91c1c", linewidth=1.2, alpha=0.75)
-    ax_return.axhline(0, color="#6b7280", linewidth=0.8)
-    ax_return.set_ylabel("Daily return, %")
-    ax_return.grid(True, alpha=0.25)
-    ax_return.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
-    ax_return.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-    return window
-
-
 def plot_rotation_view(
     frame: pd.DataFrame,
     benchmark: str,
     weights: pd.DataFrame,
+    momentum_threshold: float,
     title: str,
     output_path: Path,
 ) -> None:
@@ -411,63 +470,10 @@ def plot_rotation_view(
         0.01,
         0.01,
         (
-            f"Vertical red lines = weeks where basket return > 10%. "
+            f"Vertical red lines = week-end days where the week's basket return > "
+            f"{format_threshold(momentum_threshold)}. "
             f"Top current-cap weights: {top_weights}."
         ),
-        fontsize=9,
-        color="#4b5563",
-    )
-    fig.tight_layout(rect=[0, 0.03, 1, 1])
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def plot_basket(
-    basket: pd.Series,
-    benchmark: pd.Series,
-    turnover: pd.Series,
-    weights: pd.DataFrame,
-    title: str,
-    output_path: Path,
-) -> None:
-    fig, (ax_price, ax_turnover) = plt.subplots(
-        2,
-        1,
-        figsize=(13, 8),
-        sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]},
-    )
-
-    ax_price.plot(basket.index, basket, label="Metals basket, cap-weighted", linewidth=2.2)
-    ax_price.plot(benchmark.index, benchmark, label="Hang Seng Index", linewidth=1.6, alpha=0.8)
-    ax_price.set_title(title)
-    ax_price.set_ylabel("Indexed price, start = 100")
-    ax_price.grid(True, alpha=0.25)
-    ax_price.legend(loc="upper left")
-
-    rel_strength = basket.reindex(benchmark.index).ffill() - benchmark
-    ax_rel = ax_price.twinx()
-    ax_rel.plot(rel_strength.index, rel_strength, color="#6b7280", linewidth=1.0, alpha=0.45)
-    ax_rel.set_ylabel("Relative strength vs HSI, pct pts")
-    ax_rel.axhline(0, color="#6b7280", linewidth=0.8, alpha=0.5)
-
-    turnover_ma = turnover.rolling(20).mean()
-    ax_turnover.bar(turnover.index, turnover / 1_000_000_000, color="#8bb7d8", alpha=0.55, width=1)
-    ax_turnover.plot(turnover_ma.index, turnover_ma / 1_000_000_000, color="#1f77b4", linewidth=1.4)
-    ax_turnover.set_ylabel("HKD turnover, bn")
-    ax_turnover.grid(True, alpha=0.25)
-
-    ax_turnover.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    ax_turnover.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    fig.autofmt_xdate()
-
-    top_weights = ", ".join(
-        f"{row.ticker} {row.weight:.1%}" for row in weights.head(4).itertuples(index=False)
-    )
-    fig.text(
-        0.01,
-        0.01,
-        f"Current-cap weights. Top weights: {top_weights}. Volume shown as summed daily HKD turnover.",
         fontsize=9,
         color="#4b5563",
     )
@@ -481,11 +487,14 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     config = load_config(args.config)
-    weights = make_weights(config)
+    weights = make_weights(config, args.cache_dir, args.refresh_cache)
     tickers = weights["ticker"].tolist()
-    benchmarks = list(dict.fromkeys(args.benchmarks or [config["benchmark"]]))
+    benchmarks = resolve_benchmarks(args.benchmarks, config)
+    primary_benchmark = benchmarks[0]
 
-    close, volume = download_ohlcv(tickers + benchmarks, args.start, args.end)
+    close, volume = download_ohlcv(
+        tickers + benchmarks, args.start, args.end, args.cache_dir, args.refresh_cache
+    )
 
     usable_tickers = [ticker for ticker in tickers if ticker in close.columns and close[ticker].notna().any()]
     if len(usable_tickers) < len(tickers):
@@ -503,6 +512,9 @@ def main() -> None:
 
     rotation_summaries = []
     for benchmark in benchmarks:
+        if benchmark not in close.columns or close[benchmark].notna().sum() == 0:
+            print(f"Warning: skipping benchmark {benchmark}; no price data returned from yfinance.")
+            continue
         benchmark_series = benchmark_index(close, benchmark)
         rotation = joined_rotation_frame(
             basket=basket,
@@ -521,6 +533,7 @@ def main() -> None:
             frame=rotation,
             benchmark=benchmark,
             weights=weights,
+            momentum_threshold=args.momentum_threshold,
             title=f"{config['name']} vs {benchmark_label(benchmark)}",
             output_path=chart_path,
         )
@@ -528,10 +541,11 @@ def main() -> None:
         rotation_summaries.append(
             {
                 "benchmark": benchmark,
+                "role": "primary" if benchmark == primary_benchmark else "sanity",
                 "label": benchmark_label(benchmark),
                 "ending_relative_strength": rotation["relative_strength"].iloc[-1],
                 "turnover_breakout_days": int(rotation["turnover_breakout"].sum()),
-                "momentum_weeks": int(rotation["momentum_week_gt_10pct"].groupby(rotation.index.to_period("W-FRI")).max().sum()),
+                "momentum_weeks": int(rotation["momentum_week_above_threshold"].sum()),
                 "benchmark_rows": len(rotation),
                 "benchmark_missing_after_join": int(rotation["benchmark_index"].isna().sum()),
                 "benchmark_max_unchanged_run": max_consecutive_unchanged(rotation["benchmark_index"]),
@@ -542,34 +556,37 @@ def main() -> None:
         print(f"Wrote {chart_path}")
         print(f"Wrote {data_path}")
 
-    timing = pd.DataFrame(
-        [
-            make_timing_row(
-                benchmark=row["benchmark"],
-                frame=pd.read_csv(row["csv"], parse_dates=["date"]).set_index("date"),
-                analysis_start=args.analysis_start,
-            )
-            for row in rotation_summaries
-        ]
-    )
+    # The timing table is driven by the primary benchmark only; the others are sanity checks.
     timing_path = args.output_dir / "metals_rotation_timing.csv"
-    timing.to_csv(timing_path, index=False)
-
-    zijin_chart_path = args.output_dir / "zijin_2899_spin_off_check.png"
-    zijin_csv_path = args.output_dir / "zijin_2899_spin_off_check.csv"
-    zijin_window = plot_zijin_diagnostic(close, zijin_chart_path)
-    zijin_window.to_csv(zijin_csv_path, index_label="date")
+    primary_rows = [row for row in rotation_summaries if row["benchmark"] == primary_benchmark]
+    timing = None
+    if primary_rows:
+        timing = pd.DataFrame(
+            [
+                make_timing_row(
+                    benchmark=primary_benchmark,
+                    frame=pd.read_csv(primary_rows[0]["csv"], parse_dates=["date"]).set_index("date"),
+                    analysis_start=args.analysis_start,
+                    momentum_threshold=args.momentum_threshold,
+                )
+            ]
+        )
+        timing.to_csv(timing_path, index=False)
+    else:
+        timing_path.unlink(missing_ok=True)
+        print(f"Warning: primary benchmark {primary_benchmark} has no data; timing table not written.")
 
     print(f"Wrote {weights_path}")
-    print(f"Wrote {timing_path}")
-    print(f"Wrote {zijin_chart_path}")
-    print(f"Wrote {zijin_csv_path}")
+    if timing is not None:
+        print(f"Wrote {timing_path}")
     print()
+    print(f"Primary benchmark: {primary_benchmark} ({benchmark_label(primary_benchmark)})")
     print("Rotation summaries:")
     print(pd.DataFrame(rotation_summaries).to_string(index=False))
-    print()
-    print("Timing table:")
-    print(timing.to_string(index=False))
+    if timing is not None:
+        print()
+        print(f"Timing table (vs {primary_benchmark}):")
+        print(timing.to_string(index=False))
     print()
     print("Weights used:")
     print(weights[["ticker", "name", "weight", "market_cap_source"]].to_string(index=False))
