@@ -205,24 +205,24 @@ def make_weights(config: dict[str, Any], cache_dir: Path, refresh: bool = False)
 
 
 def normalized_cap_weighted_index(close: pd.DataFrame, weights: pd.DataFrame) -> pd.Series:
-    """Buy-and-hold cap-weighted index that drops names once they stop trading.
+    """Buy-and-hold cap-weighted index that drops names on days they do not trade.
 
-    Prices are forward-filled only between a ticker's first and last valid
-    close, so suspensions are bridged but a delisted name is not carried
-    forever. Each day's return is taken over names priced on both days,
-    weighted by their current holding value, which re-normalizes weights
-    across the survivors after an exit without a jump in the index level.
-    With no exits this equals 100 * sum(weight * price / first_price).
+    Each day's return is taken over names with a real close that day, weighted
+    by their holding value at their last known close. A delisted name simply
+    never trades again, so from its first missing day the weights re-normalize
+    across the survivors without a jump in the index level (it is treated as
+    sold at its last price). A suspended name sits out and rejoins when it
+    trades again, with the whole move since its last close landing on that day.
+    Only data up to each day is used, so no future prices leak into the past.
+    When every name trades every day this equals 100 * sum(weight * price / first_price).
     """
     tickers = weights["ticker"].tolist()
     close = close[tickers].dropna(how="all")
-    alive = close.ffill().notna() & close.bfill().notna()
-    close = close.ffill().where(alive)
     first_prices = close.apply(lambda s: s.dropna().iloc[0])
-    held = close.divide(first_prices).multiply(weights.set_index("ticker")["weight"], axis=1)
+    held = close.ffill().divide(first_prices).multiply(weights.set_index("ticker")["weight"], axis=1)
     previous = held.shift(1)
-    both = held.notna() & previous.notna()
-    growth = held.where(both).sum(axis=1) / previous.where(both).sum(axis=1)
+    traded = close.notna() & previous.notna()
+    growth = held.where(traded).sum(axis=1) / previous.where(traded).sum(axis=1)
     growth.iloc[0] = 1.0
     return 100 * growth.cumprod()
 
@@ -288,11 +288,15 @@ def joined_rotation_frame(
     trailing_std = trailing_turnover.rolling(window=window, min_periods=min_periods).std()
     frame["turnover_breakout"] = frame["turnover"] > trailing_mean + trailing_std
 
-    # Flag only the week's final trading day: that is when the weekly return is known.
+    # A week's Friday-to-Friday return is known once its Friday has passed, so the
+    # flag lands on the first trading day on or after that Friday: the Friday
+    # itself, or the next session when Friday is a holiday. Using the last day
+    # seen in the data instead would score partial weeks at the end of the data.
     week = frame.index.to_period("W-FRI")
-    week_close_dates = frame.index.to_series().groupby(week).max()
-    weekly_return = frame.loc[week_close_dates, "basket_index"].pct_change()
-    momentum_dates = weekly_return.index[weekly_return > momentum_threshold]
+    weekly_return = frame["basket_index"].groupby(week).last().pct_change()
+    hit_fridays = weekly_return.index[weekly_return > momentum_threshold].end_time.normalize()
+    flag_positions = frame.index.searchsorted(hit_fridays)
+    momentum_dates = frame.index[flag_positions[flag_positions < len(frame)]]
     frame["momentum_week_above_threshold"] = frame.index.isin(momentum_dates)
     return frame[
         [
@@ -332,6 +336,11 @@ def first_decisive_relative_lift(frame: pd.DataFrame, start: str) -> pd.Timestam
     Judgment rule: the 20-day average of relative strength must cross above
     105, the prior 60 sessions must include a base reading at/below 102, and
     the next 20 sessions must keep the 20-day average above 105.
+
+    Hindsight label, not a live signal: the "next 20 sessions" condition looks
+    ahead by design, so the date is only known 20 sessions after it. Use it to
+    evaluate when the real-time signals fired relative to the rotation, never
+    as an input a strategy could have acted on.
     """
     scoped = frame.loc[pd.Timestamp(start) :].copy()
     relative = scoped["relative_strength"]
