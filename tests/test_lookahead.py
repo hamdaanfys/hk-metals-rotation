@@ -8,15 +8,29 @@ import pandas as pd
 import pytest
 
 import build_metals_basket as bmb
+from signals import SignalParams, basket_turnover_z
 
 REAL_TIME_SIGNALS = [
     "basket_index",
     "relative_strength",
-    "turnover_breakout",
+    "relative_strength_ma",
+    "turnover_z",
+    "hot_day_count",
+    "signal_ready",
+    "rotation_on",
+    "rotation_onset",
     "momentum_week_above_threshold",
 ]
 THRESHOLD = 0.10
-TURNOVER_WINDOW = 60
+# Shorter windows than the config so 280 synthetic days produce onsets to check.
+SIGNAL = SignalParams(
+    turnover_z_window=40,
+    z_threshold=1.5,
+    count_window=5,
+    min_count=2,
+    rs_ma_window=20,
+    onset_min_off_days=10,
+)
 
 Signals = Callable[[pd.DataFrame, pd.DataFrame], pd.DataFrame]
 
@@ -27,8 +41,9 @@ def rotation_signals(market) -> Signals:
     def compute(close: pd.DataFrame, volume: pd.DataFrame) -> pd.DataFrame:
         basket = bmb.normalized_cap_weighted_index(close, market.weights)
         turnover = bmb.basket_turnover_hkd(close, volume, market.weights["ticker"].tolist())
+        turnover_z = basket_turnover_z(close, volume, market.weights, SIGNAL.turnover_z_window)
         benchmark = bmb.benchmark_index(close, market.benchmark)
-        return bmb.joined_rotation_frame(basket, benchmark, turnover, TURNOVER_WINDOW, THRESHOLD)
+        return bmb.joined_rotation_frame(basket, benchmark, turnover, turnover_z, SIGNAL, THRESHOLD)
 
     return compute
 
@@ -50,7 +65,9 @@ def truncation_mismatches(compute: Signals, market, columns: list[str]) -> list[
 def test_synthetic_data_exercises_every_signal(market):
     full = rotation_signals(market)(market.close, market.volume)
     assert full["momentum_week_above_threshold"].sum() >= 2
-    assert full["turnover_breakout"].sum() >= 5
+    assert full["rotation_on"].sum() >= 5
+    assert full["rotation_onset"].sum() >= 2
+    assert full["signal_ready"].any() and not full["signal_ready"].all()
     assert full.index[0] < market.suspension[0] and market.last_trade < full.index[-1]
     assert len(full) >= 250
 

@@ -18,6 +18,9 @@ import pandas as pd
 import yfinance as yf
 import yaml
 
+from evaluation import EvalParams, LiftParams, evaluate_setting, lift_labels, sensitivity_table
+from signals import SignalParams, basket_turnover_z, rotation_state
+
 
 DEFAULT_CONFIG = ROOT / "data" / "metals_basket.yml"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
@@ -49,12 +52,6 @@ def parse_args() -> argparse.Namespace:
             "Yahoo benchmark tickers to compare against; the first is primary. Defaults to the "
             "config's benchmark (primary) followed by its sanity_benchmarks."
         ),
-    )
-    parser.add_argument(
-        "--turnover-window",
-        type=int,
-        default=756,
-        help="Trailing trading-day window for turnover breakout threshold. Default: 756.",
     )
     parser.add_argument(
         "--momentum-threshold",
@@ -263,7 +260,8 @@ def joined_rotation_frame(
     basket: pd.Series,
     benchmark: pd.Series,
     turnover: pd.Series,
-    turnover_window: int,
+    turnover_z: pd.Series,
+    signal_params: SignalParams,
     momentum_threshold: float,
 ) -> pd.DataFrame:
     frame = pd.concat(
@@ -280,13 +278,7 @@ def joined_rotation_frame(
     frame["benchmark_index"] = 100 * frame["benchmark_raw"] / frame["benchmark_raw"].iloc[0]
     relative_raw = frame["basket_index"] / frame["benchmark_index"]
     frame["relative_strength"] = 100 * relative_raw / relative_raw.iloc[0]
-
-    window = max(1, min(turnover_window, len(frame)))
-    min_periods = min(20, window)
-    trailing_turnover = frame["turnover"].shift(1)
-    trailing_mean = trailing_turnover.rolling(window=window, min_periods=min_periods).mean()
-    trailing_std = trailing_turnover.rolling(window=window, min_periods=min_periods).std()
-    frame["turnover_breakout"] = frame["turnover"] > trailing_mean + trailing_std
+    frame = frame.join(rotation_state(turnover_z, frame["relative_strength"], signal_params))
 
     # A week's Friday-to-Friday return is known once its Friday has passed, so the
     # flag lands on the first trading day on or after that Friday: the Friday
@@ -303,15 +295,16 @@ def joined_rotation_frame(
             "basket_index",
             "benchmark_index",
             "relative_strength",
+            "relative_strength_ma",
             "turnover",
-            "turnover_breakout",
+            "turnover_z",
+            "hot_day_count",
+            "signal_ready",
+            "rotation_on",
+            "rotation_onset",
             "momentum_week_above_threshold",
         ]
     ]
-
-
-def momentum_marker_dates(frame: pd.DataFrame) -> list[pd.Timestamp]:
-    return frame.index[frame["momentum_week_above_threshold"]].tolist()
 
 
 def max_consecutive_unchanged(series: pd.Series) -> int:
@@ -330,51 +323,31 @@ def first_signal_date(frame: pd.DataFrame, column: str, start: str) -> pd.Timest
     return hits[0] if len(hits) else pd.NaT
 
 
-def first_decisive_relative_lift(frame: pd.DataFrame, start: str) -> pd.Timestamp | pd.NaT:
-    """Find the first sustained lift off the relative-strength base.
-
-    Judgment rule: the 20-day average of relative strength must cross above
-    105, the prior 60 sessions must include a base reading at/below 102, and
-    the next 20 sessions must keep the 20-day average above 105.
-
-    Hindsight label, not a live signal: the "next 20 sessions" condition looks
-    ahead by design, so the date is only known 20 sessions after it. Use it to
-    evaluate when the real-time signals fired relative to the rotation, never
-    as an input a strategy could have acted on.
-    """
-    scoped = frame.loc[pd.Timestamp(start) :].copy()
-    relative = scoped["relative_strength"]
-    relative_ma = relative.rolling(20, min_periods=10).mean()
-    recent_base = relative.rolling(60, min_periods=10).min().le(102)
-    stays_lifted = relative_ma[::-1].rolling(20, min_periods=20).min()[::-1].gt(105)
-    crosses = relative_ma.gt(105) & relative_ma.shift(1).le(105) & recent_base & stays_lifted
-    hits = scoped.index[crosses.fillna(False)]
-    return hits[0] if len(hits) else pd.NaT
-
-
 def make_timing_row(
     benchmark: str,
     frame: pd.DataFrame,
+    lifts: pd.DatetimeIndex,
     analysis_start: str,
     momentum_threshold: float,
 ) -> dict[str, Any]:
-    turnover_date = first_signal_date(frame, "turnover_breakout", analysis_start)
+    onset_date = first_signal_date(frame, "rotation_onset", analysis_start)
     momentum_date = first_signal_date(frame, "momentum_week_above_threshold", analysis_start)
-    lift_date = first_decisive_relative_lift(frame, analysis_start)
+    later_lifts = lifts[lifts >= pd.Timestamp(analysis_start)]
+    lift_date = later_lifts[0] if len(later_lifts) else pd.NaT
 
     row = {
         "benchmark": benchmark,
         "benchmark_label": benchmark_label(benchmark),
         "analysis_start": analysis_start,
         "momentum_threshold": momentum_threshold,
-        "first_turnover_breakout": turnover_date,
+        "first_rotation_onset": onset_date,
         "first_momentum_week_above_threshold": momentum_date,
-        "first_decisive_relative_lift": lift_date,
+        "first_hindsight_lift": lift_date,
     }
     for label, event_date in [
-        ("turnover", turnover_date),
+        ("onset", onset_date),
         ("momentum", momentum_date),
-        ("relative_lift", lift_date),
+        ("lift", lift_date),
     ]:
         if pd.isna(event_date):
             row[f"{label}_basket_index"] = pd.NA
@@ -392,6 +365,8 @@ def plot_rotation_view(
     frame: pd.DataFrame,
     benchmark: str,
     weights: pd.DataFrame,
+    lifts: pd.DatetimeIndex,
+    signal_params: SignalParams,
     momentum_threshold: float,
     title: str,
     output_path: Path,
@@ -399,32 +374,35 @@ def plot_rotation_view(
     fig, axes = plt.subplots(
         3,
         1,
-        figsize=(13, 9),
+        figsize=(14, 10),
         sharex=True,
-        gridspec_kw={"height_ratios": [2.2, 1.5, 1.5]},
+        gridspec_kw={"height_ratios": [2.2, 1.7, 1.3]},
     )
     ax_price, ax_relative, ax_turnover = axes
 
-    marker_dates = momentum_marker_dates(frame)
+    onsets = frame.index[frame["rotation_onset"]]
     for ax in axes:
-        for marker in marker_dates:
-            ax.axvline(marker, color="#b91c1c", linewidth=0.9, alpha=0.28)
+        for marker in frame.index[frame["momentum_week_above_threshold"]]:
+            ax.axvline(marker, color="#b91c1c", linewidth=0.7, alpha=0.12)
+        for onset in onsets:
+            ax.axvline(onset, color="#15803d", linewidth=1.1, alpha=0.7)
 
     ax_price.plot(
         frame.index,
         frame["basket_index"],
         label="Metals basket, cap-weighted",
-        linewidth=2.2,
+        linewidth=1.8,
     )
     ax_price.plot(
         frame.index,
         frame["benchmark_index"],
         label=benchmark_label(benchmark),
-        linewidth=1.7,
+        linewidth=1.4,
         alpha=0.85,
     )
+    ax_price.set_yscale("log")
     ax_price.set_title(title)
-    ax_price.set_ylabel("Rebased index, start = 100")
+    ax_price.set_ylabel("Rebased index (log), start = 100")
     ax_price.grid(True, alpha=0.25)
     ax_price.legend(loc="upper left")
 
@@ -432,45 +410,52 @@ def plot_rotation_view(
         frame.index,
         frame["relative_strength"],
         color="#0f766e",
-        linewidth=2.0,
+        linewidth=1.6,
         label="Basket / benchmark, rebased to 100",
     )
-    ax_relative.axhline(100, color="#6b7280", linewidth=0.8, alpha=0.6)
-    ax_relative.set_ylabel("Relative strength")
+    ax_relative.plot(
+        frame.index,
+        frame["relative_strength_ma"],
+        color="#6b7280",
+        linewidth=1.0,
+        alpha=0.8,
+        label=f"{signal_params.rs_ma_window}-day average",
+    )
+    ax_relative.scatter(
+        lifts,
+        frame.loc[lifts, "relative_strength"],
+        marker="^",
+        s=70,
+        color="#7c3aed",
+        zorder=4,
+        label=f"Hindsight lift ({len(lifts)})",
+    )
+    ax_relative.set_yscale("log")
+    ax_relative.set_ylabel("Relative strength (log)")
     ax_relative.grid(True, alpha=0.25)
     ax_relative.legend(loc="upper left")
 
-    breakout = frame[frame["turnover_breakout"]]
-    ax_turnover.bar(
-        frame.index,
-        frame["turnover"] / 1_000_000_000,
-        color="#8bb7d8",
-        alpha=0.45,
-        width=1,
-        label="Daily turnover",
-    )
-    ax_turnover.scatter(
-        breakout.index,
-        breakout["turnover"] / 1_000_000_000,
-        color="#b91c1c",
-        s=18,
-        label="Turnover breakout",
-        zorder=3,
-    )
     ax_turnover.plot(
         frame.index,
-        frame["turnover"].rolling(20).mean() / 1_000_000_000,
+        frame["turnover_z"],
         color="#1f77b4",
-        linewidth=1.4,
-        label="20-day avg",
+        linewidth=0.7,
+        label="Turnover z-score (weight-averaged per stock)",
     )
-    ax_turnover.set_ylabel("HKD turnover, bn")
+    ax_turnover.axhline(
+        signal_params.z_threshold,
+        color="#b91c1c",
+        linewidth=0.9,
+        linestyle="--",
+        label=f"z = {signal_params.z_threshold:g}",
+    )
+    ax_turnover.axhline(0, color="#6b7280", linewidth=0.8, alpha=0.6)
+    ax_turnover.set_ylabel("Turnover z")
     ax_turnover.grid(True, alpha=0.25)
     ax_turnover.legend(loc="upper left")
 
-    ax_turnover.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    ax_turnover.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    fig.autofmt_xdate()
+    ax_turnover.xaxis.set_major_locator(mdates.YearLocator())
+    ax_turnover.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
     top_weights = ", ".join(
         f"{row.ticker} {row.weight:.1%}" for row in weights.head(4).itertuples(index=False)
@@ -479,15 +464,17 @@ def plot_rotation_view(
         0.01,
         0.01,
         (
-            f"Vertical red lines = week-end days where the week's basket return > "
-            f"{format_threshold(momentum_threshold)}. "
-            f"Top current-cap weights: {top_weights}."
+            f"Green lines = rotation onsets ({len(onsets)}; {signal_params.label}, RS above its "
+            f"{signal_params.rs_ma_window}-day average, after {signal_params.onset_min_off_days}+ off days). "
+            f"Purple triangles = hindsight lifts (evaluation label, not a signal). "
+            f"Faint red lines = week-end days where the week's basket return > "
+            f"{format_threshold(momentum_threshold)}.\nTop current-cap weights: {top_weights}."
         ),
-        fontsize=9,
+        fontsize=8.5,
         color="#4b5563",
     )
-    fig.tight_layout(rect=[0, 0.03, 1, 1])
-    fig.savefig(output_path, dpi=180)
+    fig.tight_layout(rect=[0, 0.045, 1, 1])
+    fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
 
@@ -496,6 +483,9 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     config = load_config(args.config)
+    signal_params = SignalParams.from_config(config)
+    lift_params = LiftParams.from_config(config)
+    eval_params = EvalParams.from_config(config)
     weights = make_weights(config, args.cache_dir, args.refresh_cache)
     tickers = weights["ticker"].tolist()
     benchmarks = resolve_benchmarks(args.benchmarks, config)
@@ -514,12 +504,14 @@ def main() -> None:
 
     basket = normalized_cap_weighted_index(close, weights)
     turnover = basket_turnover_hkd(close, volume, weights["ticker"].tolist())
+    turnover_z = basket_turnover_z(close, volume, weights, signal_params.turnover_z_window)
 
     weights_path = args.output_dir / "metals_basket_weights.csv"
 
     weights.to_csv(weights_path, index=False)
 
     rotation_summaries = []
+    rotations: dict[str, tuple[pd.DataFrame, pd.DatetimeIndex]] = {}
     for benchmark in benchmarks:
         if benchmark not in close.columns or close[benchmark].notna().sum() == 0:
             print(f"Warning: skipping benchmark {benchmark}; no price data returned from yfinance.")
@@ -529,19 +521,24 @@ def main() -> None:
             basket=basket,
             benchmark=benchmark_series,
             turnover=turnover,
-            turnover_window=args.turnover_window,
+            turnover_z=turnover_z,
+            signal_params=signal_params,
             momentum_threshold=args.momentum_threshold,
         )
+        lifts = lift_labels(rotation["relative_strength"], lift_params)
+        rotations[benchmark] = (rotation, lifts)
 
         suffix = safe_name(benchmark)
         chart_path = args.output_dir / f"metals_rotation_{suffix}.png"
         data_path = args.output_dir / f"metals_rotation_{suffix}.csv"
-        rotation.to_csv(data_path, index_label="date")
+        rotation.assign(hindsight_lift=rotation.index.isin(lifts)).to_csv(data_path, index_label="date")
 
         plot_rotation_view(
             frame=rotation,
             benchmark=benchmark,
             weights=weights,
+            lifts=lifts,
+            signal_params=signal_params,
             momentum_threshold=args.momentum_threshold,
             title=f"{config['name']} vs {benchmark_label(benchmark)}",
             output_path=chart_path,
@@ -553,41 +550,77 @@ def main() -> None:
                 "role": "primary" if benchmark == primary_benchmark else "sanity",
                 "label": benchmark_label(benchmark),
                 "ending_relative_strength": rotation["relative_strength"].iloc[-1],
-                "turnover_breakout_days": int(rotation["turnover_breakout"].sum()),
+                "rotation_onsets": int(rotation["rotation_onset"].sum()),
+                "hindsight_lifts": len(lifts),
                 "momentum_weeks": int(rotation["momentum_week_above_threshold"].sum()),
                 "benchmark_rows": len(rotation),
                 "benchmark_missing_after_join": int(rotation["benchmark_index"].isna().sum()),
                 "benchmark_max_unchanged_run": max_consecutive_unchanged(rotation["benchmark_index"]),
-                "chart": chart_path,
-                "csv": data_path,
             }
         )
         print(f"Wrote {chart_path}")
         print(f"Wrote {data_path}")
 
-    # The timing table is driven by the primary benchmark only; the others are sanity checks.
+    # The timing table and the evaluation are driven by the primary benchmark;
+    # the others appear only as sanity rows in the summary.
     timing_path = args.output_dir / "metals_rotation_timing.csv"
-    primary_rows = [row for row in rotation_summaries if row["benchmark"] == primary_benchmark]
-    timing = None
-    if primary_rows:
+    evaluation_paths = {
+        "events": args.output_dir / "rotation_onset_events.csv",
+        "summary": args.output_dir / "rotation_onset_summary.csv",
+        "sensitivity": args.output_dir / "rotation_onset_sensitivity.csv",
+        "episodes": args.output_dir / "rotation_lift_episodes.csv",
+    }
+    timing = summary = sensitivity = None
+    if primary_benchmark in rotations:
+        primary_frame, primary_lifts = rotations[primary_benchmark]
         timing = pd.DataFrame(
             [
                 make_timing_row(
                     benchmark=primary_benchmark,
-                    frame=pd.read_csv(primary_rows[0]["csv"], parse_dates=["date"]).set_index("date"),
+                    frame=primary_frame,
+                    lifts=primary_lifts,
                     analysis_start=args.analysis_start,
                     momentum_threshold=args.momentum_threshold,
                 )
             ]
         )
         timing.to_csv(timing_path, index=False)
+
+        events, lift_episodes, _ = evaluate_setting(
+            primary_frame, primary_lifts, eval_params, lift_params.hold_sessions
+        )
+        events.to_csv(evaluation_paths["events"])
+        lift_episodes.to_csv(evaluation_paths["episodes"], index=False)
+
+        summary_rows = []
+        for benchmark, (frame, lifts) in rotations.items():
+            _, _, rows = evaluate_setting(frame, lifts, eval_params, lift_params.hold_sessions)
+            role = "primary" if benchmark == primary_benchmark else "sanity"
+            summary_rows += [
+                {"benchmark": benchmark, "role": role, "setting": signal_params.label, **row}
+                for row in rows
+            ]
+        summary = pd.DataFrame(summary_rows)
+        summary.to_csv(evaluation_paths["summary"], index=False)
+
+        sensitivity = sensitivity_table(
+            turnover_z, primary_frame["relative_strength"], primary_lifts,
+            signal_params, eval_params, lift_params.hold_sessions,
+        )
+        sensitivity.to_csv(evaluation_paths["sensitivity"], index=False)
     else:
-        timing_path.unlink(missing_ok=True)
-        print(f"Warning: primary benchmark {primary_benchmark} has no data; timing table not written.")
+        for path in [timing_path, *evaluation_paths.values()]:
+            path.unlink(missing_ok=True)
+        print(
+            f"Warning: primary benchmark {primary_benchmark} has no data; "
+            "timing table and onset evaluation not written."
+        )
 
     print(f"Wrote {weights_path}")
     if timing is not None:
         print(f"Wrote {timing_path}")
+        for path in evaluation_paths.values():
+            print(f"Wrote {path}")
     print()
     print(f"Primary benchmark: {primary_benchmark} ({benchmark_label(primary_benchmark)})")
     print("Rotation summaries:")
@@ -596,6 +629,12 @@ def main() -> None:
         print()
         print(f"Timing table (vs {primary_benchmark}):")
         print(timing.to_string(index=False))
+        print()
+        print(f"Onset evaluation ({signal_params.label}):")
+        print(summary.to_string(index=False))
+        print()
+        print(f"Sensitivity (vs {primary_benchmark}):")
+        print(sensitivity.to_string(index=False))
     print()
     print("Weights used:")
     print(weights[["ticker", "name", "weight", "market_cap_source"]].to_string(index=False))

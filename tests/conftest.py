@@ -45,6 +45,8 @@ def make_synthetic_market(seed: int = 7, n_days: int = 280) -> SyntheticMarket:
     - A Wednesday spikes +20% and reverses by Friday, so the partial week
       clears the momentum threshold but the full week does not.
     - A Tuesday rallies +20%, so at least one full week clears the threshold.
+    - Three five-session turnover surges, each with a modest rally, give the
+      rotation-onset signal something to fire on.
     """
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range("2024-01-01", periods=n_days)
@@ -59,12 +61,17 @@ def make_synthetic_market(seed: int = 7, n_days: int = 280) -> SyntheticMarket:
     returns[spike] += 0.20
     returns[spike + 2] -= 0.20
     returns[dates.get_loc(dates[dates.weekday == 1][20])] += 0.20
+    surge_starts = [120, 185, 235]
+    for start in surge_starts:
+        returns[start : start + 5] += 0.015
 
     close = pd.DataFrame(10 * np.exp(np.cumsum(returns, axis=0)), index=dates, columns=tickers)
     volume = pd.DataFrame(
         rng.lognormal(15, 0.4, size=close.shape), index=dates, columns=tickers
     )
     volume.iloc[rng.choice(len(dates), size=15, replace=False)] *= 4
+    for start in surge_starts:
+        volume.iloc[start : start + 5] *= 3
 
     last_trade = dates[199]
     close.loc[close.index > last_trade, "DDD"] = np.nan
