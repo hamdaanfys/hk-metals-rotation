@@ -1,0 +1,4 @@
+yfinance>=0.2.66
+pandas>=2.2
+matplotlib>=3.9
+pyyaml>=6.0

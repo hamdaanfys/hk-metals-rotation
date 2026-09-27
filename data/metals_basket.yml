@@ -1,0 +1,41 @@
+# First-pass HK metals/mining basket for the rotation-detector walking skeleton.
+#
+# The fallback market caps are rough current HKD values used only if yfinance
+# cannot return marketCap. The script writes the final weights it used to
+# outputs/metals_basket_weights.csv so the assumptions are always visible.
+#
+# 2259.HK Zijin Gold is deliberately excluded from the starter basket because
+# it does not have 3+ years of listed history.
+name: HK Diversified Metals & Mining starter basket
+benchmark: ^HSI
+constituents:
+  - ticker: 2899.HK
+    name: Zijin Mining
+    fallback_market_cap_hkd_bn: 900
+  - ticker: 1378.HK
+    name: China Hongqiao
+    fallback_market_cap_hkd_bn: 337
+  - ticker: 3993.HK
+    name: CMOC Group
+    fallback_market_cap_hkd_bn: 190
+  - ticker: 1208.HK
+    name: MMG
+    fallback_market_cap_hkd_bn: 121
+  - ticker: 1818.HK
+    name: Zhaojin Mining
+    fallback_market_cap_hkd_bn: 106
+  - ticker: 2600.HK
+    name: Aluminum Corporation of China
+    fallback_market_cap_hkd_bn: 90
+  - ticker: 0358.HK
+    name: Jiangxi Copper
+    fallback_market_cap_hkd_bn: 75
+  - ticker: 1772.HK
+    name: Ganfeng Lithium
+    fallback_market_cap_hkd_bn: 65
+  - ticker: 1258.HK
+    name: China Nonferrous Mining
+    fallback_market_cap_hkd_bn: 35
+  - ticker: 9696.HK
+    name: Tianqi Lithium
+    fallback_market_cap_hkd_bn: 25
