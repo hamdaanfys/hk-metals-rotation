@@ -1,8 +1,14 @@
-# HK metals basket rotation detector
+# HK Metals Sector-Rotation Detector
 
-One HK metals/mining basket, pulled from `yfinance`, indexed, weighted, and compared against the Hang Seng China Enterprises Index (`^HSCE`, primary benchmark), with the Hang Seng Index (`^HSI`) as a sanity check. On top of that sits a real-time rotation-onset signal and an event study that evaluates it against a hindsight label; see [Rotation-Onset Signal](#rotation-onset-signal) and [Evaluation](#evaluation).
+Can a real-time signal tell when money is rotating into Hong Kong-listed metals and mining stocks? This project builds a market-cap-weighted basket of ten HK metals names (2016–2026), flags a rotation onset when turnover surges across the basket while its relative strength against the Hang Seng China Enterprises Index (`^HSCE`) is above its 50-day average, and evaluates those onsets with an event study, a permutation test and a hindsight label of relative-strength lifts. **The signal confirms rotations rather than leading them:** all 5 onsets fired 27–152 sessions into rallies already under way (by the post-hoc revised lift label). Relative returns after onsets beat the all-days base rate (+5.7 pp over 20 sessions, p = 0.075; +7.2 pp over 60 sessions, p = 0.17), but with only 5 events that excess is not statistically significant.
 
-Run:
+![Metals basket vs the Hang Seng China Enterprises Index: rebased prices, relative strength with hindsight lifts, and the turnover z-score, with rotation onsets as green lines](outputs/metals_rotation_hsce.png)
+
+*Top: basket and `^HSCE`, rebased to 100 (log scale). Middle: relative strength with its 50-day average, and hindsight lifts under the revised (filled) and original (hollow) labels. Bottom: the basket turnover z-score. Green lines are rotation onsets.*
+
+## Quick Start
+
+Tested with Python 3.9.6 on macOS, with the exact package versions pinned in `requirements.txt`. Python 3.9 is past end of life, so newer interpreters should work but are untested.
 
 ```bash
 python3 -m venv .venv
@@ -11,6 +17,8 @@ pip install -r requirements.txt
 python scripts/build_metals_basket.py
 python scripts/check_zijin_spin_off.py
 ```
+
+`^HSI` (Hang Seng Index) is run alongside `^HSCE` as a sanity check.
 
 The default window is pinned to `--start 2016-01-01 --end 2026-05-31` (yfinance treats `end` as exclusive) so reruns are reproducible.
 
@@ -33,7 +41,7 @@ The tests run offline on small synthetic price/volume data; any call to yfinance
 - **Signal rules (`test_signals.py`).** The z-score against a hand computation, zero-volume days, new listings, the weighted basket z, the count and relative-strength conditions at their edges, onset debounce, and no onsets during warm-up.
 - **Evaluation (`test_evaluation.py`).** Forward-return alignment (next-session entry), base-rate eligibility, a reproducible permutation test that detects planted events, the scale-free lift label (hold and minimum gap) under both the original and the revised rule, with a brute-force check of the revision and a test pinning its known quirk, lift/onset episode classification, and the sensitivity grid.
 
-Outputs:
+## Outputs
 
 - `outputs/metals_rotation_hsce.png`: stacked rotation chart vs the Hang Seng China Enterprises Index (primary).
 - `outputs/metals_rotation_hsce.csv`: daily rotation data and signal flags vs the Hang Seng China Enterprises Index (primary).
@@ -72,7 +80,7 @@ basket_index = 100 * sum(constituent_weight * constituent_normalized_price)
 
 The index is chained from daily returns over the names that actually traded that day, each weighted by its holding value at its last known close. A name that stops trading is never forward-filled into the index: from its first missing day its weight is re-normalized across the remaining names, without a jump in the index level. A suspended name sits out the same way and rejoins when it trades again. This uses only data available on each day, so a suspension and a delisting look the same until the name trades again. When every name trades every day this is identical to the formula above.
 
-For this starter slice, I use current weights across the whole history. That is not perfect, but it is the right compromise for this stage: the goal is to verify the data pipeline and visually confirm the sector rally, not to produce an investable backtest. Historical weights can come later if the detector is promising.
+The basket uses current weights across the whole history. That is a known bias (see [Known Limitations](#known-limitations)), acceptable for studying rotation timing but not for an investable backtest, which would need historical weights.
 
 Volume is shown as summed daily HKD turnover:
 
@@ -199,3 +207,12 @@ The episode check only credits onsets up to 60 sessions before a lift or 20 afte
 - **Dividend-adjusted basket vs price-index benchmarks.** The basket uses dividend-adjusted closes, while `^HSCE` and `^HSI` are price indices. That pushes relative strength up by roughly the dividend yield. The comparison of onsets with the base rate cancels most of this, but a hit rate measured against zero does not.
 - **Few events, overlapping windows.** Five onsets in about 9 years gives the event study little statistical power. The 60-session windows overlap, and random dates aren't clustered the way real onsets are, so the permutation p-values are somewhat optimistic.
 - **The hindsight lift labels are imperfect, and the revised one is post hoc.** The pre-registered label misses sustained rallies whose switch-on day fails the hold. The post-hoc revision fixes that, but can label a lift on a falling day at a local low (see [Evaluation](#evaluation)). Both labels are frozen and reported side by side, and neither credits the signal with an early warning.
+
+## Future Work
+
+- **More sectors, for statistical power.** Five onsets can't separate a real effect from luck. Applying the same signal, with its parameters unchanged, to several other HK sector baskets (for example property, banks, internet and consumer) would give many more independent events and let the pooled excess return be tested properly.
+- **Out-of-sample testing of any faster variant.** The finding that the signal confirms rather than leads suggests trying faster variants, such as a shorter relative-strength average or dropping the "above its average" condition. Any such variant was designed after seeing these results, so it has to be fixed in advance and tested on data it wasn't developed on (other sectors, or history after 2026-05-31), not scored on this basket's 2016–2026 history.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

@@ -1,4 +1,6 @@
-yfinance>=0.2.66
-pandas>=2.2
-matplotlib>=3.9
-pyyaml>=6.0
+# Exact versions tested with Python 3.9.6 (macOS). Direct dependencies only.
+matplotlib==3.9.4
+numpy==2.0.2
+pandas==2.3.3
+pyyaml==6.0.3
+yfinance==1.2.0

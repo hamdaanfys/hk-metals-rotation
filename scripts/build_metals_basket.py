@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a first-pass HK metals basket chart from yfinance data."""
+"""Build the HK metals basket, its rotation signals and evaluation, and the charts."""
 
 from __future__ import annotations
 
